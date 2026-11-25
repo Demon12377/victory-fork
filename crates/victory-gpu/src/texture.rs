@@ -294,6 +294,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     if !first && before.is_none() {
         return true;
     }
+    list.stop_indirect_batch();
     card_writes(list, placed, to, None);
     crate::list::ensure_state(list, placed, COPY_DEST);
     let part = |texture: &ID3D12Resource, index: usize| D3D12_TEXTURE_COPY_LOCATION {
@@ -747,6 +748,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
             },
         };
         // SAFETY: an open list; both locations name live resources.
+        list.stop_indirect_batch();
         unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
     }
     // When the list is submitted, its copy takes what the staging buffer
@@ -870,6 +872,7 @@ pub(crate) fn card_writes(list: &HostList, resource: This, texture: &ID3D12Resou
                 Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprint },
             };
             // SAFETY: an open list; both locations name live resources.
+            list.stop_indirect_batch();
             unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
         }
     }

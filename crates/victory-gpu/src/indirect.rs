@@ -36,6 +36,8 @@ use windows::core::s;
 
 use crate::host::{HostList, host, transition};
 
+pub(crate) mod batch;
+
 const SOURCE: &str = r#"
 #define RS "RootConstants(num32BitConstants=7, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
 cbuffer Record : register(b0) {

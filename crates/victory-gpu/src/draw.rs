@@ -136,6 +136,8 @@ struct Window {
     scratch: ID3D12Resource,
     dst_offset: u64,
     epoch: u64,
+    jumped: bool,
+    read: bool,
 }
 
 /// The most records clamped in one pass ([`windows`]).
@@ -167,7 +169,7 @@ const WINDOW_MOST: u64 = 128;
 /// run with windows was announced that way seconds ahead.
 fn windows() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1")) && !crate::drvwatch::tripped()
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1")) && !crate::drvwatch::tripped() && !crate::indirect::batch::enabled()
 }
 
 /// Only widen to a window if two full padded records fit. The clamp copies
@@ -225,6 +227,109 @@ impl std::ops::Deref for MadeTables {
     }
 }
 
+/// Whether a record that is not on the window's walk opens a window of its
+/// own at once, with the step the title was last seen to walk that
+/// argument buffer by (`VICTORY_WINDOW_JUMP=1`; `alt`: twenty seconds
+/// with, twenty without, in turn, each change said in the log). Off by
+/// default. Needs [`windows`].
+///
+/// Run 243 counted, per frame, 2,370 indirect commands read from a window
+/// and 2,370 clamped by a pass of ours; 960 of those passes were for
+/// records "off the window's walk": the title draws a few records one
+/// after the other and then jumps to another place in the same argument
+/// buffer, some 480 times a frame. The record after a jump was clamped
+/// alone (its step is not known from one record), and the one after it
+/// opened a window of sixteen: two passes a jump, each one a trip of the
+/// card from drawing to compute and back (9 microseconds in the game).
+///
+/// With the switch the step of the last window that draws did read from
+/// is remembered with its argument buffer, kind and stride, and a record
+/// that would be clamped alone on that buffer opens sixteen records at
+/// that step instead: what the next record would have opened anyway, one
+/// record earlier, so no more of the list's budget is spent than before.
+/// If no draw reads from a window opened that way before the next pass,
+/// the step is forgotten until a walk shows it again: a title that draws
+/// lone records all over a buffer gets what it had.
+fn jump_windows() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_WINDOW_JUMP").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "a record off the window's walk opens a window at the remembered step from now (VICTORY_WINDOW_JUMP=alt): {}",
+                    if on { "ON" } else { "off, as usual" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// The records of a window opened at a remembered step ([`jump_windows`]):
+/// what the record after a lone one opens.
+const WINDOW_JUMP: u32 = 16;
+
+/// What a record that would be clamped alone opens instead, if the step
+/// its argument buffer is walked by is remembered: that step and how many
+/// records (never past the buffer, of which `left` bytes are left from
+/// the record on). None if nothing is remembered for this buffer, kind
+/// and stride, or no second record fits.
+fn jump_window(remembered: Option<(u64, u32, u32, u32)>, (copy, kind, stride): (u64, u32, u32), left: u64) -> Option<(u32, u32)> {
+    let (c, k, s, step) = remembered?;
+    if (c, k, s) != (copy, kind, stride) || step == 0 {
+        return None;
+    }
+    let fit = (left / u64::from(step)).min(u64::from(WINDOW_JUMP)) as u32;
+    (fit > 1).then_some((step, fit))
+}
+
+/// Diagnostics of [`windows`]: indirect commands since the last line, by
+/// what became of their clamp. In order: read from a window (no pass of
+/// ours); then clamped by a pass of ours because: it is a dispatch; it
+/// asks for more than one record; it has a count buffer; its shaders can
+/// store to buffers; it is the list's first; there was no window on its
+/// argument buffer (another buffer, kind or stride, or the window was
+/// ended); its record does not continue the window's walk; it is past the
+/// window's end (the next window: as meant). And the records those passes
+/// clamped in all; the passes that opened a window at a remembered step
+/// ([`jump_windows`]), and those of them no draw read from.
+#[cfg(feature = "diagnostics")]
+pub(crate) static WINDOW_WHY: [std::sync::atomic::AtomicU64; 12] = [const { std::sync::atomic::AtomicU64::new(0) }; 12];
+
+/// The line of [`WINDOW_WHY`], per frame over `frames` frames.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn window_line(frames: f64) {
+    let n: Vec<f64> = WINDOW_WHY.iter().map(|n| n.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames.max(1.0)).collect();
+    tracing::info!(
+        "indirect commands per frame by their clamp: {:.0} read from a window (no pass of ours); a pass of ours for {:.0}: {:.0} dispatches, {:.0} of more than one record, {:.0} with a count \
+         buffer, {:.0} whose shaders can store to buffers, {:.0} first on their list, {:.0} with no window on their argument buffer, {:.0} off the window's walk, {:.0} past the window's end; \
+         {:.0} records clamped by those passes; {:.0} of the passes opened a window at a remembered step (VICTORY_WINDOW_JUMP=1), {:.0} of those windows were read by no draw",
+        n[0],
+        n[1..9].iter().sum::<f64>(),
+        n[1],
+        n[2],
+        n[3],
+        n[4],
+        n[5],
+        n[6],
+        n[7],
+        n[8],
+        n[9],
+        n[10],
+        n[11],
+    );
+}
+
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
@@ -255,8 +360,12 @@ pub(crate) struct State {
     blend: Option<[f32; 4]>,
     stencil: Option<u32>,
     depth_bounds: Option<[f32; 2]>,
-    /// Active indirect argument windows clamped in this list ([`windows`]).
+    /// Active indirect argument windows clamped in this list.
     windows: Vec<Window>,
+    /// The observed step for jump windows.
+    walk_step: Option<(u64, u32, u32, u32)>,
+    #[cfg(feature = "diagnostics")]
+    last_indirect: (u64, u64),
     /// What the host list has: pipeline, root signature, heaps.
     host_pipeline: usize,
     /// Graphics, compute.
@@ -2092,6 +2201,7 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        list.stop_indirect_batch();
         // It may write the arguments active windows hold clamped.
         self.windows.clear();
         #[cfg(feature = "diagnostics")]
@@ -2403,6 +2513,7 @@ impl State {
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
+        list.stop_indirect_batch();
         self.windows.clear();
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
@@ -2816,6 +2927,7 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
+        list.stop_indirect_batch();
         self.windows.clear();
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
@@ -2921,6 +3033,7 @@ impl State {
         base: i32,
         first_instance: u32,
     ) {
+        list.stop_indirect_batch();
         self.windows.clear();
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
@@ -3056,18 +3169,31 @@ impl State {
         const WINDOW_USE: usize = usize::MAX - 0x77;
         let offset = args.offset(arguments);
         let stores = p.stages.iter().any(|stage| stage.translated().stores);
+        let from_batch = if crate::indirect::batch::accepts(kind, max, count.is_some(), stores) && !args.in_place() {
+            if crate::indirect::batch::enabled() { args.refresh(list, arguments, len); }
+            list.batch_argument(&args.buffer, offset, kind, stride)
+        } else { None };
+        if from_batch.is_none() { list.stop_indirect_batch(); }
+        if from_batch.is_some() { self.windows.clear(); }
         let windowed = windows() && kind != DISPATCH && max == 1 && count.is_none() && !stores;
         // Another host list (a new one after a cut, or this one after its
         // reset) has another scratch buffer, or this one's with old bytes.
-        if kind == DISPATCH || max != 1 || count.is_some() || stores || list.first_use(WINDOW_USE) {
-            self.windows.clear();
-        }
+        let first_on_list = list.first_use(WINDOW_USE);
+        if !windowed || first_on_list { self.windows.clear(); }
         let epoch = list.indirect_epoch();
         self.windows.retain(|w| w.epoch == epoch);
+        #[cfg(feature = "diagnostics")]
+        let why_not = if !windows() { usize::MAX } else if kind == DISPATCH { 1 } else if max != 1 { 2 } else if count.is_some() { 3 } else if !windowed { 4 } else if first_on_list { 5 } else {
+            match self.windows.iter().rev().find(|w| w.copy == args.id() && w.kind == kind && w.stride == stride) {
+                None => 6,
+                Some(w) if offset >= w.base && (offset - w.base).is_multiple_of(u64::from(w.step)) => 8,
+                Some(_) => 7,
+            }
+        };
         let same = |w: &Window| w.copy == args.id() && w.kind == kind && w.stride == stride;
         let hit = windowed
             .then(|| {
-                self.windows.iter().rev().find(|w| {
+                self.windows.iter().enumerate().rev().find(|(_, w)| {
                     same(w)
                         && offset >= w.base
                         && (offset - w.base).is_multiple_of(u64::from(w.step))
@@ -3075,9 +3201,10 @@ impl State {
                 })
             })
             .flatten()
-            .map(|w| (w.scratch.clone(), w.dst_offset + (offset - w.base), w.step));
-        let (bounded, at) = match hit {
-            Some((scratch, at, step)) => {
+            .map(|(index, w)| (w.scratch.clone(), w.dst_offset + (offset - w.base), w.step, index));
+        let (bounded, at) = match (from_batch, hit) {
+            (Some(pair), _) => pair,
+            (None, Some((scratch, at, step, index))) => {
                 // Diagnostics of windows: the record clamped again and
                 // compared (`crate::indirect::window_check`).
                 if crate::indirect::window_check()
@@ -3092,13 +3219,25 @@ impl State {
                     self.host_pipeline = 0;
                     self.host_roots[1] = 0;
                 }
+                #[cfg(feature = "diagnostics")]
+                WINDOW_WHY[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let w = &mut self.windows[index];
+                if !w.read {
+                    w.read = true;
+                    if w.records > 1 { self.walk_step = Some((w.copy, w.kind, w.stride, w.step)); }
+                }
                 (scratch, at)
             }
-            None => {
-                // A record a short step after the last matching window's last
-                // one (the same step as that window's, if it had one): the
-                // title walks the buffer, so the ones that step apart after it
-                // are clamped with it.
+            (None, None) => {
+                if let Some(w) = self.windows.iter_mut().rev().find(|w| same(w)) {
+                    if w.jumped && !w.read {
+                        self.walk_step = None;
+                        #[cfg(feature = "diagnostics")]
+                        WINDOW_WHY[11].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    w.jumped = false;
+                }
+                let mut window_jumped = false;
                 let (step, records) = match self.windows.iter().rev().find(|w| same(w)) {
                     Some(w) if windowed => {
                         let last = w.base + u64::from(w.records - 1) * u64::from(w.step);
@@ -3116,6 +3255,21 @@ impl State {
                         }
                     }
                     _ => (stride, max),
+                };
+                // A record that would be clamped alone, on a buffer whose
+                // step is remembered: the window the next record would
+                // open, opened here ([`jump_windows`]).
+                let (step, records) = match (windowed && records == 1 && jump_windows())
+                    .then(|| jump_window(self.walk_step, (args.id(), kind, stride), args.left(arguments)))
+                    .flatten()
+                {
+                    Some(jumped) => {
+                        window_jumped = true;
+                        #[cfg(feature = "diagnostics")]
+                        WINDOW_WHY[10].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        jumped
+                    }
+                    None => (step, records),
                 };
                 args.refresh(list, arguments, len.max(u64::from(step) * u64::from(records)));
                 if let Some((s, at)) = &counter {
@@ -3154,6 +3308,31 @@ impl State {
                     why("not bounded (no clamp, or arguments not 4-byte aligned)");
                     return false;
                 };
+                #[cfg(feature = "diagnostics")]
+                if why_not < WINDOW_WHY.len() {
+                    WINDOW_WHY[why_not].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    WINDOW_WHY[9].fetch_add(u64::from(records), std::sync::atomic::Ordering::Relaxed);
+                    // One in 256 of the draws that miss their window, said:
+                    // where the record lies against the window and against
+                    // the record drawn before it.
+                    if (6..=8).contains(&why_not) {
+                        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                        if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed).is_multiple_of(256) {
+                            let (last_copy, last_offset) = self.last_indirect;
+                            tracing::info!(
+                                "a window miss (one in 256): cause {why_not}, kind {kind}, stride {stride}, buffer {} offset {offset:#x} ({} left); the command before it on the list: buffer {last_copy} offset \
+                                 {last_offset:#x} (this one is {} bytes on); the window it missed: {}; clamped now: {records} records at step {step}",
+                                args.id(),
+                                args.left(arguments),
+                                offset as i64 - last_offset as i64,
+                                match self.windows.iter().rev().find(|w| same(w)) {
+                                    Some(w) => format!("buffer {} kind {} stride {} base {:#x} step {} records {} (this record is {} bytes from its base)", w.copy, w.kind, w.stride, w.base, w.step, w.records, offset as i64 - w.base as i64),
+                                    None => "none".to_string(),
+                                }
+                            );
+                        }
+                    }
+                }
                 self.host_pipeline = 0;
                 self.host_roots[1] = 0;
                 if windowed {
@@ -3172,11 +3351,17 @@ impl State {
                         scratch: bounded.clone(),
                         dst_offset,
                         epoch: new_epoch,
+                        jumped: window_jumped,
+                        read: false,
                     });
                 }
                 (bounded, dst_offset)
             }
         };
+        #[cfg(feature = "diagnostics")]
+        {
+            self.last_indirect = (args.id(), offset);
+        }
         let ran = match kind {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
@@ -3557,5 +3742,27 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
     {
         // SAFETY: an open list on a device that supports depth bounds.
         unsafe { l1.OMSetDepthBounds(min, max) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_lone_record_opens_a_window_at_the_remembered_step() {
+        // (a mesh dispatch is kind 10, a draw kind 0)
+        let remembered = Some((7u64, 10u32, 12u32, 32u32));
+        // the same buffer, kind and stride: sixteen records at the title's step
+        assert_eq!(jump_window(remembered, (7, 10, 12), 1 << 20), Some((32, 16)));
+        // never past the buffer: 100 bytes left hold three records 32 apart
+        assert_eq!(jump_window(remembered, (7, 10, 12), 100), Some((32, 3)));
+        // one record fits: nothing to open
+        assert_eq!(jump_window(remembered, (7, 10, 12), 40), None);
+        // another buffer, kind or stride, or nothing remembered: alone, as before
+        assert_eq!(jump_window(remembered, (8, 10, 12), 1 << 20), None);
+        assert_eq!(jump_window(remembered, (7, 0, 12), 1 << 20), None);
+        assert_eq!(jump_window(remembered, (7, 10, 16), 1 << 20), None);
+        assert_eq!(jump_window(None, (7, 10, 12), 1 << 20), None);
     }
 }
