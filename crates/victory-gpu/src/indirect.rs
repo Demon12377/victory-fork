@@ -2182,6 +2182,63 @@ void main() {
         }
     }
 
+    /// Two equal sign-bit changes in the last load of lanes 0 and 32
+    /// used to cancel when those lanes met in the hash reduction. Exercise
+    /// both zero and seeded nonzero pages; single-byte flips miss this bug.
+    #[test]
+    fn warp_card_compare_detects_paired_sign_bit_flips() {
+        let mut warp = WarpHarness::new().expect("WARP is required for the hash regression");
+        let compare = compile_cs(&warp.device, crate::host::CARD_COMPARE).unwrap();
+        const PIECE: usize = 64 << 10;
+        const PIECES: usize = 129;
+        let size = PIECE * PIECES;
+        let (_now, now_ptr, now_gpu) = warp.shared_buffer(size as u64);
+        let (_hashes, _, hashes_gpu) = warp.shared_buffer((PIECES * 16) as u64);
+        let (_differs, differs_ptr, differs_gpu) = warp.shared_buffer((PIECES * 4) as u64);
+        let mut content = vec![0u8; size];
+        for piece in 1..PIECES {
+            let mut seed = piece as u32;
+            for word in content[piece * PIECE..(piece + 1) * PIECE].chunks_exact_mut(4) {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                word.copy_from_slice(&seed.to_le_bytes());
+            }
+        }
+        // SAFETY: the mapping covers the complete allocation.
+        unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), now_ptr, size) };
+        let run = |warp: &mut WarpHarness, mode: u32| -> Vec<u32> {
+            // SAFETY: an open list with the compare's root signature and
+            // live buffers; the result mapping has one dword per piece.
+            unsafe {
+                warp.list.SetComputeRootSignature(&compare.root);
+                warp.list.SetPipelineState(&compare.pso);
+                let constants = [0u32, 0, size as u32, PIECES as u32, 0, mode];
+                warp.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                warp.list.SetComputeRootShaderResourceView(1, now_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+                warp.list.Dispatch(PIECES as u32, 1, 1);
+            }
+            warp.submit_and_wait();
+            // SAFETY: the GPU finished and the result mapping covers the pieces.
+            (0..PIECES).map(|i| unsafe { differs_ptr.cast::<u32>().add(i).read_volatile() }).collect()
+        };
+        run(&mut warp, 0);
+        assert_eq!(run(&mut warp, 1), vec![0; PIECES]);
+        for piece in 0..PIECES {
+            for offset in [64512usize + 3, 65024 + 3] {
+                let at = piece * PIECE + offset;
+                // SAFETY: the offsets are inside each mapped page.
+                unsafe { now_ptr.add(at).write_volatile(content[at] ^ 0x80) };
+            }
+        }
+        let changed = run(&mut warp, 1);
+        assert_eq!(changed, vec![1; PIECES], "paired writes must flag every changed page");
+        assert_eq!(run(&mut warp, 2), vec![1; PIECES]);
+        assert_eq!(run(&mut warp, 2), vec![0; PIECES]);
+    }
+
     #[test]
     fn host_list_bound_ahead_at_keeps_multiple_windows_disjoint() {
         let Some(host) = super::host() else {
